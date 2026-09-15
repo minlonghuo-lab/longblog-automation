@@ -1,5 +1,8 @@
 FROM node:22-alpine
 
+# 飞牛环境适配：apk 默认源在国内极慢（单个包可卡数分钟），换阿里云镜像
+RUN sed -i 's|dl-cdn.alpinelinux.org|mirrors.aliyun.com|g' /etc/apk/repositories
+
 RUN apk add --no-cache \
     python3 py3-requests git openssh-client ca-certificates tzdata curl
 
