@@ -6,12 +6,12 @@ import logging
 import os
 import subprocess
 import sys
-
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from notify import notify_report  # noqa: E402
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from notify import notify_report  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 RUNTIME = Path(os.environ.get("LONGBLOG_RUNTIME_DIR", ROOT / "runtime"))
