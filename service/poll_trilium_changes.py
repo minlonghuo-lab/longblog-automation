@@ -143,6 +143,9 @@ def write_json(path, value):
 def differences(old, new):
     changes = []
     watched = ("title", "publish", "sync", "aiRefresh", "pinned", "contentHash")
+    # 只有显式标签变化才触发同步：纯内容/标题编辑不再自动推送，
+    # 用户改完内容后需要自己把 sync 置为 true 才推（2026-10-07 用户要求）。
+    triggers = ("publish", "sync", "aiRefresh", "pinned")
     for note_id, item in new.items():
         previous = old.get(note_id)
         if previous is None:
@@ -150,8 +153,9 @@ def differences(old, new):
                 changes.append({"type": "new", "note": item, "changed": ["publish"]})
             continue
         changed = [key for key in watched if previous.get(key) != item.get(key)]
-        if changed:
-            changes.append({"type": "changed", "note": item, "changed": changed})
+        triggered = [key for key in changed if key in triggers]
+        if triggered:
+            changes.append({"type": "changed", "note": item, "changed": triggered})
     for note_id, previous in old.items():
         if note_id not in new and (previous.get("publish") or previous.get("syncHash")):
             changes.append({"type": "removed", "note": previous, "changed": ["removed"]})
