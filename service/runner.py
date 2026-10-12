@@ -25,11 +25,27 @@ SYNC_SCRIPT = ROOT / "service/sync_trilium_posts.py"
 REPO_URL = os.environ.get("LONGBLOG_REPO_URL", "")
 REMOTE = os.environ.get("LONGBLOG_GIT_REMOTE", "origin")
 BRANCH = os.environ.get("LONGBLOG_GIT_BRANCH", "main")
+SSH_CONFIG = os.environ.get("LONGBLOG_GIT_SSH_CONFIG", "/data/ssh/config")
 SSH_KEY = os.environ.get("LONGBLOG_GIT_SSH_KEY", "/data/ssh/id_ed25519")
-GIT_SSH = os.environ.get(
-    "LONGBLOG_GIT_SSH_COMMAND",
-    f"ssh -i {SSH_KEY} -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/data/ssh/known_hosts",
+
+# Reach GitHub over ssh.github.com:443 by default. Plain github.com:22 is blocked
+# from this host, which is also why git_proxy.py's "proxy unreachable, fall back
+# to direct" path never rescued anything: it fell back to the blocked port.
+# /data/ssh/config scopes the redirect to github.com; the inline form is the
+# fallback for a deployment that ships no such file.
+#
+# Routing through a proxy is therefore opt-in through LONGBLOG_GIT_SSH_COMMAND.
+# It used to be the default, but the NAS proxy died on 2026-10-07 (every node
+# timed out, git fetch failed with "Connection closed by UNKNOWN port 65535") and
+# the pipeline only worked again once the direct route was forced in the running
+# container, where that edit was not tracked by this repository.
+_DEFAULT_GIT_SSH = (
+    f"ssh -F {SSH_CONFIG}"
+    if Path(SSH_CONFIG).is_file()
+    else f"ssh -i {SSH_KEY} -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes"
+    " -o UserKnownHostsFile=/data/ssh/known_hosts -o HostName=ssh.github.com -p 443"
 )
+GIT_SSH = os.environ.get("LONGBLOG_GIT_SSH_COMMAND") or _DEFAULT_GIT_SSH
 
 
 def logger():

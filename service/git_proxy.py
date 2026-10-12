@@ -8,7 +8,9 @@
     ProxyCommand=python3 /app/service/git_proxy.py %h %p
 
 代理地址从 LONGBLOG_GIT_PROXY 读取（默认 host.docker.internal:7890，Clash mixed 端口）。
-连不上代理时自动回退直连，避免代理挂了导致完全不可用。
+连不上代理时回退直连，但回退目标是 ssh 传入的 %h:%p，也就是 github.com:22——本机
+这个端口不通，所以回退救不了；代理挂掉等于彻底不可用。runner.py 的默认 ssh 命令
+因此走 ssh.github.com:443，只有确实要经代理时才用本文件覆盖它。
 """
 import os
 import select
