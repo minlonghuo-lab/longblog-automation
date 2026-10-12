@@ -304,13 +304,20 @@ NOTE_ID_ATTR = re.compile(r'data-note-id="([^"]+)"', re.IGNORECASE)
 
 
 def render_include_note_card(note_id: str, target: dict) -> str:
+    """Build the card for an embedded note.
+
+    The href follows the blog's routing contract: article URLs are
+    `/blog/<noteId>/`, ASCII and with a trailing slash. The slug is editable and
+    kept only for search and for the legacy redirect map, so an internal link
+    built from it would depend on that migration table.
+    """
     summary = str(target.get("summary") or "").strip()
     summary_html = (
         f'<span class="include-note-card-summary">{html_escape(summary, quote=True)}</span>'
         if summary else ""
     )
     return (
-        f'<a class="include-note-card" href="/blog/{html_escape(str(target["slug"]), quote=True)}"'
+        f'<a class="include-note-card" href="/blog/{html_escape(note_id, quote=True)}/"'
         f' data-note-id="{html_escape(note_id, quote=True)}">'
         '<span class="include-note-card-label">相关文章</span>'
         f'<span class="include-note-card-title">{html_escape(str(target.get("title") or ""), quote=True)}</span>'
