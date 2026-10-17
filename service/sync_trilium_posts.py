@@ -14,6 +14,7 @@ from typing import Dict, List, Optional, Tuple
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from asset_cleanup import prune_unused_assets
 
 BASE_URL = os.environ.get("TRILIUM_BASE_URL", "").rstrip("/")
 TOKEN = os.environ.get("TRILIUM_ETAPI_TOKEN", "")
@@ -21,7 +22,6 @@ ROOT_NOTE_ID = os.environ.get("TRILIUM_BLOG_ROOT_NOTE_ID", "zB8WioyKlvOw")
 BASE_DIR = os.environ.get("LONGBLOG_REPO_DIR") or os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 OUT_CONTENT_TS = os.path.join(BASE_DIR, "src", "data", "trilium-posts.content.generated.ts")
 OUT_META_TS = os.path.join(BASE_DIR, "src", "data", "trilium-posts.meta.generated.ts")
-LEGACY_OUT_TS = os.path.join(BASE_DIR, "src", "data", "trilium-posts.generated.ts")
 ASSET_DIR = os.path.join(BASE_DIR, "public", "trilium-assets")
 AUTO_PUSH = os.environ.get("LONGBLOG_AUTO_PUSH", "false").lower() == "true"
 GIT_REMOTE = os.environ.get("LONGBLOG_GIT_REMOTE", "origin")
@@ -767,6 +767,7 @@ def main():
         "aiUpdated": [],
         "removed": [],
         "removedAssets": [],
+        "prunedAssets": [],
         "workspaceDir": BASE_DIR,
     }
 
@@ -925,6 +926,17 @@ def main():
     report["removedAssets"] = cleanup_removed_assets([item["id"] for item in report["removed"]])
     report["includeCards"] = apply_include_note_cards(posts)
     write_generated_files(posts)
+    # Reclaim old URL-hash variants only after a complete, usable snapshot.
+    # A failed download may leave a remote attachment URL without raising above.
+    if report["failed"]:
+        report["assetCleanupSkipped"] = "sync contains failed notes"
+    elif any(find_attachment_urls(post["contentHtml"]) for post in posts):
+        report["assetCleanupSkipped"] = "snapshot contains unresolved attachment URLs"
+    else:
+        try:
+            report["prunedAssets"] = prune_unused_assets(posts, ASSET_DIR)
+        except (ValueError, OSError) as error:
+            report["assetCleanupSkipped"] = str(error)[:300]
     report["gitChanged"] = git_has_changes()
     report["autoPushEnabled"] = AUTO_PUSH
     if AUTO_PUSH and report["gitChanged"]:

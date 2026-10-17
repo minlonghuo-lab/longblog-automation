@@ -316,6 +316,23 @@ public/trilium-assets/
 
 不会提交 `.env`、ETAPI Token 或 SSH 私钥。
 
+### 文章附件回收
+
+完整同步成功并写出文章数据后，服务按最终正文中 `/trilium-assets/` 的引用回收旧附件。只处理本次输出文章目录内、符合生成文件名规则的文件；跨文章引用会统一保留，不处理品牌图片、友链图标、手动命名文件或符号链接。
+
+同步存在失败记录、附件 URL 尚未完成本地化，或正文引用的本地文件缺失时，跳过回收。报告中的 `prunedAssets` 列出已回收路径，`assetCleanupSkipped` 说明跳过原因。回收代码构建进容器镜像，更新仓库后需重新构建并启动镜像才能生效：
+
+```bash
+git pull
+docker compose up -d --build
+```
+
+本地可离线验证回收逻辑，不需要 NAS 或 Trilium 凭证：
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
 ## 11. 巡检和日志
 
 一键巡检：
