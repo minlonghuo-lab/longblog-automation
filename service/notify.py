@@ -45,7 +45,6 @@ def summarize(report: dict) -> tuple[str, str]:
     removed = report.get("removed") or []
     unchanged = report.get("unchanged") or []
     removed_assets = report.get("removedAssets") or []
-    ai_updated = report.get("aiUpdated") or []
 
     if failed:
         title = "longBlog 自动发布失败"
@@ -61,8 +60,8 @@ def summarize(report: dict) -> tuple[str, str]:
     title = "longBlog 自动发布"
     body = (
         f"事件 {report.get('event') or '-'}｜"
-        f"更新{len(updated)}篇｜撤下{len(removed)}篇｜清理资源{len(removed_assets)}个｜"
-        f"未变{len(unchanged)}篇｜失败{len(failed)}篇｜AI {len(ai_updated)}篇｜"
+        f"更新{len(updated)}篇｜撤下{len(removed)}篇｜清理资源{len(removed_assets) + len(report.get('prunedAssets') or [])}个｜"
+        f"未变{len(unchanged)}篇｜失败{len(failed)}篇｜"
         f"Git变更 {bool(report.get('gitChanged'))}｜已推送 {bool(report.get('gitPushed'))}｜构建 {bool(report.get('buildRan'))}"
     )
     return title, body

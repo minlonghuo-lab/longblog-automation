@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import fcntl
-import hashlib
 import json
 import os
 import subprocess
@@ -25,6 +24,8 @@ CTX_FILE = STATE_DIR / "last_event.json"
 LOCK_FILE = STATE_DIR / "poller.lock"
 SUCCESS_FILE = STATE_DIR / "poller_last_success"
 LOG_FILE = LOG_DIR / "poller.log"
+POLICY_FILE = STATE_DIR / "publication_policy.json"
+POLICY_VERSION = 2
 RUNNER = ROOT_DIR / "service/runner.py"
 TEMPLATE_NOTE_ID = os.environ.get("TRILIUM_TEMPLATE_NOTE_ID", "MC7PtiChdF5S")
 SKIP_KEYWORDS = tuple(x.strip().lower() for x in os.environ.get(
@@ -113,14 +114,9 @@ def snapshot():
             "title": note.get("title") or "未命名",
             "publish": bool_label(item_labels, "publish"),
             "sync": bool_label(item_labels, "sync"),
-            "aiRefresh": bool_label(item_labels, "aiRefresh"),
-            "pinned": bool_label(item_labels, "pinned"),
             "publishedAt": last_label(item_labels, "publishedAt"),
             "syncHash": last_label(item_labels, "syncHash"),
         }
-        if item["publish"] or item["sync"] or item["aiRefresh"] or item["syncHash"]:
-            body = get(f"/etapi/notes/{note['noteId']}/content", text=True, timeout=60)
-            item["contentHash"] = hashlib.sha256(body.encode()).hexdigest()
         result[note["noteId"]] = item
     return result
 
@@ -142,20 +138,21 @@ def write_json(path, value):
 
 def differences(old, new):
     changes = []
-    watched = ("title", "publish", "sync", "aiRefresh", "pinned", "contentHash")
-    # 只有显式标签变化才触发同步：纯内容/标题编辑不再自动推送，
-    # 用户改完内容后需要自己把 sync 置为 true 才推（2026-10-07 用户要求）。
-    triggers = ("publish", "sync", "aiRefresh", "pinned")
+    # Publishing is explicit: a draft edit, retired field, or sync acknowledgement
+    # must not trigger a release. No article bodies are fetched by the poller.
     for note_id, item in new.items():
         previous = old.get(note_id)
         if previous is None:
-            if item["publish"] or item["sync"] or item["aiRefresh"]:
+            if item["publish"]:
                 changes.append({"type": "new", "note": item, "changed": ["publish"]})
             continue
-        changed = [key for key in watched if previous.get(key) != item.get(key)]
-        triggered = [key for key in changed if key in triggers]
-        if triggered:
-            changes.append({"type": "changed", "note": item, "changed": triggered})
+        changed = []
+        if bool(previous.get("publish")) != bool(item.get("publish")):
+            changed.append("publish")
+        if item.get("publish") and item.get("sync") and not previous.get("sync"):
+            changed.append("sync")
+        if changed:
+            changes.append({"type": "changed", "note": item, "changed": changed})
     for note_id, previous in old.items():
         if note_id not in new and (previous.get("publish") or previous.get("syncHash")):
             changes.append({"type": "removed", "note": previous, "changed": ["removed"]})
@@ -163,22 +160,33 @@ def differences(old, new):
 
 
 def context(changes):
-    # Specialized fast paths are safe only for exactly one isolated change.
+    # Keep single-note event context while passing every requested ID to a batch.
     change = changes[0]
     note, changed = change["note"], change.get("changed") or []
     event = "sync_requested"
     payload = {"sync": "true"}
-    if len(changes) == 1 and changed == ["pinned"]:
-        event, payload = "pinned_changed", {"pinned": str(note.get("pinned", False)).lower()}
-    elif len(changes) == 1 and changed == ["publish"]:
+    if len(changes) == 1 and changed == ["publish"]:
         event, payload = "publish_changed", {"publish": str(note.get("publish", False)).lower()}
-    elif len(changes) == 1 and changed == ["aiRefresh"] and note.get("aiRefresh"):
-        event, payload = "ai_refresh_requested", {"aiRefresh": "true"}
     return {
         "requestId": f"poller-{note.get('id')}-{int(time.time())}", "event": event,
-        "noteId": note.get("id"), "noteTitle": note.get("title"), **payload,
+        "noteId": note.get("id") if len(changes) == 1 else "",
+        "noteIds": [c["note"]["id"] for c in changes], "noteTitle": note.get("title"), **payload,
         "triggeredAt": now_iso(), "source": "poller", "changes": [c.get("changed") for c in changes],
     }
+
+
+def pending_context(pending, changes):
+    if not pending:
+        return context(changes) if changes else {
+            "event": "metadata_migrated", "source": "poller", "noteIds": [],
+        }
+    if not changes:
+        return pending
+    fresh = context(changes)
+    note_ids = set(pending.get("noteIds") or []) | set(fresh["noteIds"])
+    if pending.get("noteId"):
+        note_ids.add(pending["noteId"])
+    return {**fresh, "event": "sync_requested", "noteId": "", "noteIds": sorted(note_ids)}
 
 
 def main():
@@ -196,20 +204,40 @@ def main():
             old, new = read_json(SNAPSHOT_FILE), snapshot()
             if not old:
                 write_json(SNAPSHOT_FILE, new)
+                write_json(POLICY_FILE, {"version": POLICY_VERSION})
                 log(f"initialized snapshot notes={len(new)}")
             else:
                 changes = differences(old, new)
-                if changes:
-                    log(f"changes={len(changes)}; processing sequentially")
-                    for change in changes:
-                        ctx = context([change])
-                        write_json(CTX_FILE, ctx)
-                        log(f"event={ctx['event']} noteId={ctx['noteId']} changed={change.get('changed')}")
-                        result = subprocess.run([os.environ.get("PYTHON_BIN", "python3"), str(RUNNER)], env={**os.environ, "LONGBLOG_REPO_DIR": REPO_DIR}, timeout=int(os.environ.get("LONGBLOG_RUN_TIMEOUT", "1200")))
-                        if result.returncode:
-                            raise RuntimeError(f"runner exited {result.returncode} for note {ctx['noteId']}")
-                    write_json(SNAPSHOT_FILE, snapshot())
-                    log(f"runner ok for {len(changes)} change(s); snapshot updated")
+                pending = read_json(CTX_FILE)
+                upgrade = read_json(POLICY_FILE).get("version") != POLICY_VERSION
+                if changes or pending or upgrade:
+                    ctx = pending_context(pending, changes)
+                    # Persist intent before the runner acknowledges sync=false.
+                    # Build/push failures retry the same batch on the next poll.
+                    write_json(CTX_FILE, ctx)
+                    log(f"changes={len(changes)} event={ctx['event']} noteIds={ctx.get('noteIds', [])}")
+                    result = subprocess.run([os.environ.get("PYTHON_BIN", "python3"), str(RUNNER)],
+                        env={**os.environ, "LONGBLOG_REPO_DIR": REPO_DIR},
+                        timeout=int(os.environ.get("LONGBLOG_RUN_TIMEOUT", "1200")))
+                    if result.returncode:
+                        raise RuntimeError(f"runner exited {result.returncode}")
+                    after = snapshot()
+                    acknowledged = dict(new)
+                    completed_ids = set(ctx.get("noteIds") or [])
+                    if ctx.get("noteId"):
+                        completed_ids.add(ctx["noteId"])
+                    for note_id in completed_ids:
+                        if note_id in new:
+                            acknowledged[note_id] = {
+                                **after.get(note_id, new[note_id]),
+                                "publish": new[note_id]["publish"], "sync": False,
+                            }
+                    # New requests received during the build remain different
+                    # from this baseline and will run on the next poll.
+                    write_json(SNAPSHOT_FILE, acknowledged)
+                    write_json(POLICY_FILE, {"version": POLICY_VERSION})
+                    CTX_FILE.unlink(missing_ok=True)
+                    log("runner ok; snapshot updated")
                 else:
                     log(f"no changes notes={len(new)}")
             SUCCESS_FILE.touch()

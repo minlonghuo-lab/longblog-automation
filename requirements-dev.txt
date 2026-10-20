@@ -1,0 +1,2 @@
+# Production uses Alpine py3-requests; this is for local offline-service tests.
+requests>=2.32.0,<3

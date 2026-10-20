@@ -1,6 +1,6 @@
 # 飞牛 EVO2：TriliumNext → GitHub 自动发布部署包
 
-这套部署包用于在飞牛 EVO2 上运行 longBlog 自动发布服务：你只需要在飞牛 Docker 中的 TriliumNext 里写作和修改标签，自动化容器会通过 ETAPI 检测变化、生成博客数据、构建验证并推送到 GitHub。
+这套部署包用于在飞牛 EVO2 上运行 longBlog 自动发布服务：你只需要在飞牛 Docker 中的 TriliumNext 里写作，使用“发布”和“同步”控制上线，自动化容器会通过 ETAPI 检测发布指令、生成博客数据、构建验证并推送到 GitHub。
 
 ## 1. 稳定主链路
 
@@ -11,7 +11,7 @@ poll_trilium_changes.py（每 60 秒检测）
   ↓
 runner.py（锁、Git 工作区、构建、提交、推送、报告）
   ↓
-sync_trilium_posts.py（文章/标签/附件转换）
+sync_trilium_posts.py（正文/本地摘要/附件转换）
   ↓
 GitHub longBlog:main
   ↓
@@ -250,9 +250,11 @@ initialized snapshot notes=N
 
 初始化后，在 Trilium 中任选文章：
 
-- 修改正文；或
-- 将 `sync` 改为 `true`；或
-- 修改 `publish` / `pinned`。
+- 新文章将 `publish` 设为 `true`；
+- 已发布文章修改完成后，将 `sync` 设为 `true`；
+- 撤下文章将 `publish` 设为 `false`。
+
+仅编辑正文或标题不会发布，`sync` 回写为 `false` 也不会再次触发。
 
 最多等待一个轮询周期，然后运行：
 
@@ -260,19 +262,40 @@ initialized snapshot notes=N
 ./scripts/check.sh
 ```
 
-## 8. 支持的文章标签
+## 8. 文章发布属性
 
-| 标签 | 作用 |
+| 属性 | 作用 |
 |---|---|
 | `publish=true` | 发布文章 |
 | `publish=false` | 从博客撤下 |
 | `sync=true` | 强制同步正文和附件，完成后自动回写 false |
-| `pinned=true/false` | 置顶/取消置顶，不改变首次发布时间 |
-| `aiRefresh=true` | 强制刷新 AI 摘要/标签（需要配置模型密钥） |
 | `publishedAt` | 首次发布时间，只在从未发布时创建 |
 | `updatedAt` | 最近成功同步时间 |
 | `syncStatus` | `publishing` / `published` / `removed` / `error` |
 | `syncHash` | 内容指纹 |
+
+### 摘要与旧字段迁移
+
+摘要由已发布正文的首段有效文字自动提取，最多 80 个字符，优先按句子截取。代码、Mermaid 源码、表格、标题、引用和图片容器不会进入摘要；没有合适正文时使用文章标题作为导读。不调用 AI，不需要模型密钥，也不再向 Trilium 回写摘要或文章标签。摘要继续供博客 SEO、引用卡片和桌面小宠物使用。
+
+`tags`、`summary`、`aiRefresh`、`pinned` 已退役。升级后，已有快照的实例会自动运行一次迁移：
+
+1. 先把博客子树和 `TRILIUM_TEMPLATE_NOTE_ID` 指定模板中这四个字段的自有值、`label:` 升级属性定义和 `child:` 复制定义备份到 `data/runtime/state/retired_attributes_backup.json`；
+2. 删除上述旧属性，包括截图里的四个入口。不会修改博客范围外的属性来源或其它关系；
+3. 从仓库中已发布的正文重新生成摘要、清空导出标签并移除置顶数据，不读取尚未要求同步的正文修改，保留首次发布和更新时间；
+4. 构建验证并推送，成功后记录 `data/runtime/state/publication_policy.json`，后续只处理新发布指令。
+
+`tags: []` 保留在生成数据中，以兼容博客当前的数据结构；不会再生成或处理标签。首次部署仍只建立快照，首次手动发布/同步时执行字段清理。失败任务保存在 `last_event.json` 中，构建或推送失败后自动重试；多篇文章的指令合并为一次构建和推送。
+
+升级生产容器（在 NAS 的现有部署目录执行）：
+
+```bash
+git pull --ff-only
+docker compose up -d --build
+./scripts/check.sh
+```
+
+镜像重建并连接 Trilium 后，旧字段才会从编辑器中消失。请备份运行态目录，其中保留旧字段值；若使用了不同模板，需先设置正确的 `TRILIUM_TEMPLATE_NOTE_ID`。
 
 ## 9. 首次发布时间保护
 
@@ -310,7 +333,6 @@ data/runtime/state/published_at_registry.json
 ```text
 src/data/trilium-posts.content.generated.ts
 src/data/trilium-posts.meta.generated.ts
-src/data/posts.ts
 public/trilium-assets/
 ```
 
@@ -330,7 +352,9 @@ docker compose up -d --build
 本地可离线验证回收逻辑，不需要 NAS 或 Trilium 凭证：
 
 ```bash
-python3 -m unittest discover -s tests -v
+python3 -m venv .venv
+.venv/bin/pip install -r requirements-dev.txt
+.venv/bin/python -m unittest discover -s tests -v
 ```
 
 ## 11. 巡检和日志
@@ -460,7 +484,7 @@ tail -100 data/runtime/logs/runner.log
 tail -100 data/runtime/logs/poller.log
 ```
 
-正文变化、标题、`publish`、`sync`、`pinned`、`aiRefresh` 都会检测。
+只有 `publish` 的变化和 `sync=true` 才触发发布；正文或标题编辑完成后，需要主动设置 `sync=true`。笔记删除或移出博客子树会撤下对应文章。
 
 ## 15. 安全说明
 

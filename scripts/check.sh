@@ -27,6 +27,6 @@ if not p.exists():
     print('暂无运行报告（首次快照初始化后属正常）')
 else:
     d=json.loads(p.read_text())
-    for k in ('runStartedAt','runFinishedAt','event','noteId','updated','removed','failed','gitChanged','gitPushed','buildRan'):
+    for k in ('runStartedAt','runFinishedAt','event','noteId','updated','removed','failed','retiredAttributesRemoved','prunedAssets','assetCleanupSkipped','gitChanged','gitPushed','buildRan'):
         print(f'{k}: {d.get(k)}')
 PY

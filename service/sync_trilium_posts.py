@@ -5,8 +5,6 @@ import re
 import json
 import hashlib
 import mimetypes
-import subprocess
-import time
 from datetime import datetime, timezone, timedelta
 from html import escape as html_escape
 from typing import Dict, List, Optional, Tuple
@@ -15,25 +13,17 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from asset_cleanup import prune_unused_assets
+from article_metadata import normalize_post_metadata, summarize_html
+from legacy_attributes import cleanup_legacy_attributes
 
 BASE_URL = os.environ.get("TRILIUM_BASE_URL", "").rstrip("/")
 TOKEN = os.environ.get("TRILIUM_ETAPI_TOKEN", "")
-ROOT_NOTE_ID = os.environ.get("TRILIUM_BLOG_ROOT_NOTE_ID", "zB8WioyKlvOw")
+ROOT_NOTE_ID = os.environ.get("TRILIUM_BLOG_ROOT_NOTE_ID", "")
 BASE_DIR = os.environ.get("LONGBLOG_REPO_DIR") or os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 OUT_CONTENT_TS = os.path.join(BASE_DIR, "src", "data", "trilium-posts.content.generated.ts")
 OUT_META_TS = os.path.join(BASE_DIR, "src", "data", "trilium-posts.meta.generated.ts")
 ASSET_DIR = os.path.join(BASE_DIR, "public", "trilium-assets")
-AUTO_PUSH = os.environ.get("LONGBLOG_AUTO_PUSH", "false").lower() == "true"
-GIT_REMOTE = os.environ.get("LONGBLOG_GIT_REMOTE", "origin")
-GIT_BRANCH = os.environ.get("LONGBLOG_GIT_BRANCH", "main")
-TEMPLATE_NOTE_ID = "MC7PtiChdF5S"
-
-if not BASE_URL:
-    raise SystemExit("TRILIUM_BASE_URL not set")
-if not TOKEN:
-    raise SystemExit("TRILIUM_ETAPI_TOKEN not set")
-if not ROOT_NOTE_ID:
-    raise SystemExit("TRILIUM_BLOG_ROOT_NOTE_ID not set")
+TEMPLATE_NOTE_ID = os.environ.get("TRILIUM_TEMPLATE_NOTE_ID", "MC7PtiChdF5S")
 
 SESSION = requests.Session()
 SESSION.mount("http://", HTTPAdapter(max_retries=Retry(total=3, backoff_factor=0.6, status_forcelist=(429, 500, 502, 503, 504))))
@@ -43,7 +33,7 @@ HEADERS_JSON = {"Authorization": f"Bearer {TOKEN}", "Content-Type": "application
 HEADERS_AUTH = {"Authorization": f"Bearer {TOKEN}"}
 SKIP_KEYWORDS = ("template", "模板", "logo", "素材", "draft-template", "index-template")
 TZ_UTC8 = timezone(timedelta(hours=8))
-STATE_LABEL_NAMES = ["publish", "sync", "aiRefresh", "pinned", "syncStatus"]
+STATE_LABEL_NAMES = ["publish", "sync", "syncStatus"]
 PUBLISHED_AT_REGISTRY = os.path.join(os.environ.get("LONGBLOG_RUNTIME_DIR", os.path.join(os.path.dirname(BASE_DIR), "runtime")), "state", "published_at_registry.json")
 
 
@@ -404,32 +394,7 @@ def localize_attachments(html: str, note_id: str) -> Tuple[str, List[str], bool]
     return html, local_assets, changed
 
 
-def parse_tags(attr_map: Dict[str, List[dict]]) -> List[str]:
-    values = [a.get("value", "") for a in attr_map.get("tags", [])]
-    if len(values) == 1 and "," in values[0]:
-        values = [x.strip() for x in values[0].split(",")]
-    return [v.strip() for v in values if v and v.strip()]
-
-
-def generate_ai_meta(title: str, content_html: str, existing_summary: str, existing_tags: List[str], *, force_summary: bool, max_total_tags: int = 5) -> dict:
-    payload = {
-        "title": title,
-        "content": content_html,
-        "summary": existing_summary,
-        "tags": existing_tags,
-        "max_total_tags": max_total_tags,
-        "max_new_tags": max(0, max_total_tags - len(existing_tags)),
-        "force_summary": force_summary,
-    }
-    cmd = ["python3", os.path.join(BASE_DIR, "scripts", "ai_generate_meta.py")]
-    output = subprocess.check_output(cmd, input=json.dumps(payload, ensure_ascii=False), text=True)
-    data = json.loads(output)
-    tags = [str(x).strip() for x in (data.get("tags") or []) if str(x).strip()][:max_total_tags]
-    summary = str(data.get("summary") or existing_summary).strip()
-    return {"summary": summary, "tags": tags}
-
-
-def build_post_record(note: dict, used_slugs: set, previous_slug_map: Dict[str, str], *, force_ai_refresh: bool = False) -> Tuple[dict, dict]:
+def build_post_record(note: dict, used_slugs: set, previous_slug_map: Dict[str, str]) -> Tuple[dict, dict]:
     note_id = note["noteId"]
     attr_map = label_attrs(note.get("attributes", []) or [])
     title = (note.get("title") or "未命名").strip()
@@ -439,39 +404,8 @@ def build_post_record(note: dict, used_slugs: set, previous_slug_map: Dict[str, 
     explicit_slug = last_label_value(attr_map, "slug", "").strip()
     base_slug = explicit_slug or slugify(title)
     slug = ensure_unique_slug(base_slug, note_id, used_slugs, previous_slug_map)
-    ai_refresh = force_ai_refresh or bool_label_value(attr_map, "aiRefresh", False)
-    summary = last_label_value(attr_map, "summary", "").strip()
-    tags = parse_tags(attr_map)
-    ai_generated = False
-    ai_tags_only = False
-
-    if ai_refresh or not summary or not tags:
-        try:
-            existing_tags = list(tags)
-            ai_result = generate_ai_meta(
-                title,
-                html_localized,
-                summary,
-                existing_tags,
-                force_summary=bool(ai_refresh),
-                max_total_tags=5,
-            )
-            if ai_refresh or not summary:
-                summary = ai_result.get("summary", summary).strip()
-            tags = ai_result.get("tags", existing_tags)[:5]
-            ai_generated = True
-            ai_tags_only = False
-        except Exception:
-            pass
-
-    pinned = bool_label_value(attr_map, "pinned", False)
-    payload_for_hash = {
-        "title": title,
-        "slug": slug,
-        "summary": summary,
-        "tags": tags,
-        "contentHtml": html_localized,
-    }
+    summary = summarize_html(html_localized, title)
+    payload_for_hash = {"title": title, "slug": slug, "contentHtml": html_localized}
     sync_hash = hashlib.sha256(json.dumps(payload_for_hash, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
     post = {
         "id": note_id,
@@ -479,10 +413,9 @@ def build_post_record(note: dict, used_slugs: set, previous_slug_map: Dict[str, 
         "title": title,
         "updatedAt": last_label_value(attr_map, "updatedAt", "").strip() or note.get("dateModified") or note.get("utcDateModified") or now_str(),
         "publishedAt": last_label_value(attr_map, "publishedAt", "").strip(),
-        "tags": tags,
+        "tags": [],
         "summary": summary,
         "contentHtml": html_localized,
-        "pinned": pinned,
         "syncHash": sync_hash,
         "syncStatus": last_label_value(attr_map, "syncStatus", ""),
     }
@@ -491,9 +424,6 @@ def build_post_record(note: dict, used_slugs: set, previous_slug_map: Dict[str, 
         "localAssets": local_assets,
         "computedSyncHash": sync_hash,
         "prevSyncHash": last_label_value(attr_map, "syncHash", ""),
-        "aiRefresh": ai_refresh,
-        "aiGenerated": ai_generated,
-        "aiTagsOnly": ai_tags_only,
         "syncRequested": bool_label_value(attr_map, "sync", False),
     }
     return post, meta
@@ -515,7 +445,6 @@ def split_post_records(posts: List[dict]) -> Tuple[List[dict], List[dict]]:
             "updatedAt": post["updatedAt"],
             "publishedAt": post.get("publishedAt", ""),
             "tags": post.get("tags", []),
-            "pinned": bool(post.get("pinned")),
             "syncHash": post.get("syncHash", ""),
             "syncStatus": post.get("syncStatus", ""),
         })
@@ -523,7 +452,7 @@ def split_post_records(posts: List[dict]) -> Tuple[List[dict], List[dict]]:
 
 
 def sort_meta_records(metas: List[dict]) -> List[dict]:
-    return sorted(metas, key=lambda x: (x.get("pinned", False), x.get("publishedAt", x.get("updatedAt", "")), x.get("id", "")), reverse=True)
+    return sorted(metas, key=lambda x: (x.get("publishedAt", x.get("updatedAt", "")), x.get("id", "")), reverse=True)
 
 
 def write_generated_files(posts: List[dict]):
@@ -550,7 +479,8 @@ def write_generated_files(posts: List[dict]):
 def load_existing_content_records() -> List[dict]:
     if not os.path.exists(OUT_CONTENT_TS):
         return []
-    text = open(OUT_CONTENT_TS, "r", encoding="utf-8").read()
+    with open(OUT_CONTENT_TS, "r", encoding="utf-8") as source:
+        text = source.read()
     marker = "export const triliumPostContents: TriliumPostContentRecord[] = "
     start = text.find(marker)
     if start == -1:
@@ -570,7 +500,8 @@ def load_existing_content_records() -> List[dict]:
 def load_existing_meta_records() -> List[dict]:
     if not os.path.exists(OUT_META_TS):
         return []
-    text = open(OUT_META_TS, "r", encoding="utf-8").read()
+    with open(OUT_META_TS, "r", encoding="utf-8") as source:
+        text = source.read()
     marker = "export const triliumPostMetas: TriliumPostMetaRecord[] = "
     start = text.find(marker)
     if start == -1:
@@ -587,171 +518,18 @@ def load_existing_meta_records() -> List[dict]:
     return data if isinstance(data, list) else []
 
 
-def write_meta_only(metas: List[dict]):
-    metas = sort_meta_records(metas)
-    meta_text = "// Auto-generated from Trilium ETAPI\n"
-    meta_text += "export interface TriliumPostMetaRecord {\n"
-    meta_text += "  id: string; slug: string; updatedAt: string; publishedAt?: string; tags: string[]; pinned?: boolean; syncHash?: string; syncStatus?: string;\n"
-    meta_text += "}\n\n"
-    meta_text += "export const triliumPostMetas: TriliumPostMetaRecord[] = " + json.dumps(metas, ensure_ascii=False, indent=2) + ";\n"
-    with open(OUT_META_TS, "w", encoding="utf-8") as f:
-        f.write(meta_text)
-
-
-def handle_pinned_only_update(args, report) -> bool:
-    if args.event != "pinned_changed" or not args.noteId:
-        return False
-    metas = load_existing_meta_records()
-    if not metas:
-        return False
-
-    target_pinned = None
-    if getattr(args, "pinned", ""):
-        raw = str(args.pinned).strip().lower()
-        if raw in {"true", "1", "yes", "on"}:
-            target_pinned = True
-        elif raw in {"false", "0", "no", "off"}:
-            target_pinned = False
-
-    note = None
-    attr_map = {}
-    pinned = False
-    pinned_stable = target_pinned is None
-    for attempt in range(8):
-        note = get_json(f"/etapi/notes/{args.noteId}")
-        attr_map = label_attrs(note.get("attributes", []) or [])
-        pinned = bool_label_value(attr_map, "pinned", False)
-        if target_pinned is None or pinned == target_pinned:
-            pinned_stable = True
-            break
-        time.sleep(0.8)
-
-    if target_pinned is not None and not pinned_stable:
-        report["pinnedFallbackToFullSync"] = True
-        report["pinnedTarget"] = target_pinned
-        report["pinnedObserved"] = pinned
-        return False
-
-    updated_at = now_str()
-    found = False
-    changed = False
-    for meta in metas:
-        if meta.get("id") != args.noteId:
-            continue
-        found = True
-        old_pinned = bool(meta.get("pinned"))
-        if old_pinned != pinned:
-            meta["pinned"] = pinned
-            # Keep original publishedAt/updatedAt stable for pin-only changes.
-            changed = True
-        meta["syncStatus"] = "published"
-        report[("updated" if changed else "unchanged")].append({
-            "id": args.noteId,
-            "title": note.get("title", "未命名"),
-            "pinned": bool(meta.get("pinned")),
-        })
-        break
-    if not found:
-        return False
-    set_label(args.noteId, "syncStatus", "published")
-    # Do not write updatedAt for pin-only changes; sorting should stay based on original publishedAt.
-    write_meta_only(metas)
-    report["gitChanged"] = git_has_changes()
-    report["autoPushEnabled"] = AUTO_PUSH
-    if AUTO_PUSH and report["gitChanged"]:
-        message = f"chore(trilium): {'pin' if pinned else 'unpin'} post - {note.get('title', '未命名')}"
-        ok, output = git_commit_and_push(message)
-        report["gitPushed"] = ok
-        report["gitMessage"] = message
-        report["gitOutput"] = output[-2000:]
-    else:
-        report["gitPushed"] = False
-    print(json.dumps(report, ensure_ascii=False, indent=2))
-    return True
-
-
-def cleanup_removed_assets(note_ids: List[str]) -> List[str]:
-    removed_dirs = []
-    for note_id in note_ids:
-        path = os.path.join(ASSET_DIR, note_id)
-        if os.path.isdir(path):
-            subprocess.run(["rm", "-rf", path], check=False)
-            removed_dirs.append(note_id)
-    return removed_dirs
-
-
-def git_has_changes() -> bool:
-    r = subprocess.run(["git", "status", "--porcelain", "--untracked-files=no", "src/data/trilium-posts.content.generated.ts", "src/data/trilium-posts.meta.generated.ts", "public/trilium-assets"], cwd=BASE_DIR, capture_output=True, text=True)
-    return bool(r.stdout.strip())
-
-
-def git_sync_remote() -> Tuple[bool, str]:
-    fetch_res = subprocess.run(["git", "fetch", GIT_REMOTE, GIT_BRANCH], cwd=BASE_DIR, capture_output=True, text=True)
-    fetch_text = (fetch_res.stdout or "") + (fetch_res.stderr or "")
-    if fetch_res.returncode != 0:
-        return False, fetch_text.strip()
-
-    local_head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=BASE_DIR, capture_output=True, text=True)
-    remote_head = subprocess.run(["git", "rev-parse", f"{GIT_REMOTE}/{GIT_BRANCH}"], cwd=BASE_DIR, capture_output=True, text=True)
-    if local_head.returncode != 0 or remote_head.returncode != 0:
-        details = []
-        if fetch_text.strip():
-            details.append(fetch_text.strip())
-        if local_head.returncode != 0:
-            details.append((local_head.stderr or local_head.stdout).strip())
-        if remote_head.returncode != 0:
-            details.append((remote_head.stderr or remote_head.stdout).strip())
-        return False, "\n".join([x for x in details if x])
-
-    if local_head.stdout.strip() == remote_head.stdout.strip():
-        return True, fetch_text.strip()
-
-    rebase_res = subprocess.run(["git", "rebase", f"{GIT_REMOTE}/{GIT_BRANCH}"], cwd=BASE_DIR, capture_output=True, text=True)
-    rebase_text = (rebase_res.stdout or "") + (rebase_res.stderr or "")
-    if rebase_res.returncode != 0:
-        subprocess.run(["git", "rebase", "--abort"], cwd=BASE_DIR, capture_output=True, text=True)
-        details = []
-        if fetch_text.strip():
-            details.append(fetch_text.strip())
-        if rebase_text.strip():
-            details.append(rebase_text.strip())
-        return False, "\n".join(details)
-
-    details = []
-    if fetch_text.strip():
-        details.append(fetch_text.strip())
-    if rebase_text.strip():
-        details.append(rebase_text.strip())
-    return True, "\n".join(details)
-
-
-def git_commit_and_push(message: str) -> Tuple[bool, str]:
-    add_res = subprocess.run(["git", "add", "src/data/trilium-posts.content.generated.ts", "src/data/trilium-posts.meta.generated.ts", "public/trilium-assets", "src/data/posts.ts"], cwd=BASE_DIR, capture_output=True, text=True)
-    if add_res.returncode != 0:
-        return False, (add_res.stderr or add_res.stdout).strip()
-    commit_res = subprocess.run(["git", "commit", "-m", message], cwd=BASE_DIR, capture_output=True, text=True)
-    commit_text = (commit_res.stdout or "") + (commit_res.stderr or "")
-    if commit_res.returncode != 0:
-        if "nothing to commit" in commit_text.lower():
-            return True, "nothing to commit"
-        return False, commit_text.strip()
-    push_res = subprocess.run(["git", "push", GIT_REMOTE, GIT_BRANCH], cwd=BASE_DIR, capture_output=True, text=True)
-    push_text = (push_res.stdout or "") + (push_res.stderr or "")
-    if push_res.returncode != 0:
-        return False, push_text.strip()
-    return True, (commit_text + "\n" + push_text).strip()
-
-
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--requestId", default="")
     p.add_argument("--event", default="")
     p.add_argument("--noteId", default="")
-    p.add_argument("--pinned", default="")
+    p.add_argument("--noteIds", nargs="*", default=[])
     return p.parse_args()
 
 
 def main():
+    if not BASE_URL or not TOKEN or not ROOT_NOTE_ID:
+        raise SystemExit("TRILIUM_BASE_URL / TRILIUM_ETAPI_TOKEN / TRILIUM_BLOG_ROOT_NOTE_ID is required")
     args = parse_args()
     root = get_json(f"/etapi/notes/{ROOT_NOTE_ID}")
     report = {
@@ -764,34 +542,26 @@ def main():
         "updated": [],
         "unchanged": [],
         "failed": [],
-        "aiUpdated": [],
         "removed": [],
         "removedAssets": [],
         "prunedAssets": [],
         "workspaceDir": BASE_DIR,
     }
 
-    if handle_pinned_only_update(args, report):
-        return
-
-    if AUTO_PUSH:
-        sync_ok, sync_text = git_sync_remote()
-        report["gitRemoteSynced"] = sync_ok
-        if sync_text.strip():
-            report["gitSyncOutput"] = sync_text[-2000:]
-        if not sync_ok:
-            report["gitChanged"] = False
-            report["autoPushEnabled"] = AUTO_PUSH
-            report["gitPushed"] = False
-            print(json.dumps(report, ensure_ascii=False, indent=2))
-            return
-
     all_notes = walk_note_tree(ROOT_NOTE_ID)
-    notes_by_id = {n.get("noteId"): n for n in all_notes}
-    if args.noteId and args.noteId in notes_by_id:
-        ordered_notes = [notes_by_id[args.noteId]] + [n for n in all_notes if n.get("noteId") != args.noteId]
-    else:
-        ordered_notes = all_notes
+    cleanup_notes = list(all_notes)
+    if TEMPLATE_NOTE_ID and not any(note.get("noteId") == TEMPLATE_NOTE_ID for note in all_notes):
+        try:
+            cleanup_notes.append(get_json(f"/etapi/notes/{TEMPLATE_NOTE_ID}"))
+        except requests.HTTPError as error:
+            if error.response is None or error.response.status_code != 404:
+                raise
+    report["retiredAttributesRemoved"] = cleanup_legacy_attributes(
+        cleanup_notes, lambda attribute_id: delete_path(f"/etapi/attributes/{attribute_id}"),
+        os.path.join(os.path.dirname(PUBLISHED_AT_REGISTRY), "retired_attributes_backup.json"),
+    )
+    targeted_ids = set(args.noteIds) | ({args.noteId} if args.noteId else set())
+    ordered_notes = sorted(all_notes, key=lambda note: note.get("noteId") not in targeted_ids)
 
     candidates = []
     for note in ordered_notes:
@@ -844,38 +614,26 @@ def main():
         try:
             note_id = note.get("noteId")
             attr_map = label_attrs(note.get("attributes", []) or [])
-            targeted_note = bool(args.noteId and note_id == args.noteId)
-            force_ai_refresh = targeted_note and args.event == "ai_refresh_requested"
+            targeted_note = note_id in targeted_ids
             sync_requested = bool_label_value(attr_map, "sync", False)
-            ai_refresh = force_ai_refresh or bool_label_value(attr_map, "aiRefresh", False)
             existing_meta_item = existing_meta_map.get(note_id)
             existing_content_item = existing_content_map.get(note_id)
             can_reuse_existing = bool(existing_meta_item and existing_content_item)
             publish_requested = targeted_note and args.event == "publish_changed"
             targeted_sync_requested = targeted_note and args.event == "sync_requested"
-            needs_full_sync = bool(sync_requested or ai_refresh or publish_requested or targeted_sync_requested or not can_reuse_existing)
+            needs_full_sync = bool(sync_requested or publish_requested or targeted_sync_requested or not can_reuse_existing)
 
             if needs_full_sync:
-                post, meta = build_post_record(note, used_slugs, previous_slug_map, force_ai_refresh=force_ai_refresh)
+                post, meta = build_post_record(note, used_slugs, previous_slug_map)
                 if not post["publishedAt"]:
                     post["publishedAt"] = published_at_registry.get(note_id, "") or (existing_meta_item or {}).get("publishedAt", "")
                 first_publish = not post["publishedAt"]
-                targeted_event_for_note = targeted_note and args.event in {"publish_changed", "sync_requested", "pinned_changed", "ai_refresh_requested"}
-                needs_publish = first_publish or meta["syncRequested"] or meta["aiRefresh"] or targeted_event_for_note
+                targeted_event_for_note = targeted_note and args.event in {"publish_changed", "sync_requested"}
+                needs_publish = first_publish or meta["syncRequested"] or targeted_event_for_note
                 if needs_publish:
                     set_label(note_id, "syncStatus", "publishing")
                     ts = now_str()
                     set_label(note_id, "slug", post["slug"])
-                    if meta["aiGenerated"]:
-                        if post["summary"]:
-                            set_label(note_id, "summary", post["summary"])
-                        set_label(note_id, "tags", ",".join(post["tags"]))
-                        report["aiUpdated"].append({
-                            "id": note_id,
-                            "title": post["title"],
-                            "tagsOnly": meta["aiTagsOnly"],
-                            "tags": post["tags"],
-                        })
                     if not post["publishedAt"]:
                         post["publishedAt"] = ts
                         set_label(note_id, "publishedAt", ts)
@@ -889,33 +647,28 @@ def main():
                     set_label(note_id, "updatedAt", ts)
                     set_label(note_id, "syncStatus", "published")
                     set_label(note_id, "sync", "false")
-                    if meta["aiRefresh"]:
-                        set_label(note_id, "aiRefresh", "false")
                     post["syncStatus"] = "published"
                     post["updatedAt"] = ts
-                    report["updated"].append({"id": note_id, "title": post["title"], "pinned": post["pinned"]})
+                    report["updated"].append({"id": note_id, "title": post["title"]})
                 else:
                     set_label(note_id, "syncStatus", "published")
                     post["syncStatus"] = "published"
-                    report["unchanged"].append({"id": note_id, "title": post["title"], "pinned": post["pinned"]})
+                    report["unchanged"].append({"id": note_id, "title": post["title"]})
             else:
-                pinned = bool_label_value(attr_map, "pinned", False)
                 post = {
                     "id": note_id,
                     "slug": existing_meta_item.get("slug", slugify(note.get("title") or "未命名")),
                     "title": existing_content_item.get("title") or note.get("title") or "未命名",
                     "updatedAt": existing_meta_item.get("updatedAt") or now_str(),
                     "publishedAt": existing_meta_item.get("publishedAt") or "",
-                    "tags": existing_meta_item.get("tags") or [],
+                    "tags": [],
                     "summary": existing_content_item.get("summary") or "",
                     "contentHtml": existing_content_item.get("contentHtml") or "",
-                    "pinned": pinned,
                     "syncHash": existing_meta_item.get("syncHash") or "",
                     "syncStatus": "published",
                 }
-                set_label(note_id, "syncStatus", "published")
-                report["unchanged"].append({"id": note_id, "title": post["title"], "pinned": post["pinned"]})
-            posts.append(post)
+                report["unchanged"].append({"id": note_id, "title": post["title"]})
+            posts.append(normalize_post_metadata(post))
         except Exception as e:
             try:
                 set_label(note.get("noteId"), "syncStatus", "error")
@@ -923,37 +676,23 @@ def main():
                 pass
             report["failed"].append({"id": note.get("noteId"), "title": note.get("title"), "error": str(e)[:300]})
 
-    report["removedAssets"] = cleanup_removed_assets([item["id"] for item in report["removed"]])
+    if report["failed"]:
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 1
     report["includeCards"] = apply_include_note_cards(posts)
     write_generated_files(posts)
     # Reclaim old URL-hash variants only after a complete, usable snapshot.
     # A failed download may leave a remote attachment URL without raising above.
-    if report["failed"]:
-        report["assetCleanupSkipped"] = "sync contains failed notes"
-    elif any(find_attachment_urls(post["contentHtml"]) for post in posts):
+    if any(find_attachment_urls(post["contentHtml"]) for post in posts):
         report["assetCleanupSkipped"] = "snapshot contains unresolved attachment URLs"
     else:
         try:
-            report["prunedAssets"] = prune_unused_assets(posts, ASSET_DIR)
+            report["prunedAssets"] = prune_unused_assets(posts + [{"id": item["id"], "contentHtml": ""} for item in report["removed"]], ASSET_DIR)
         except (ValueError, OSError) as error:
             report["assetCleanupSkipped"] = str(error)[:300]
-    report["gitChanged"] = git_has_changes()
-    report["autoPushEnabled"] = AUTO_PUSH
-    if AUTO_PUSH and report["gitChanged"]:
-        if report["updated"]:
-            titles = [item["title"] for item in report["updated"][:3]]
-            suffix = "..." if len(report["updated"]) > 3 else ""
-            message = f"chore(trilium): sync {len(report['updated'])} post(s) - {', '.join(titles)}{suffix}"
-        else:
-            message = "chore(trilium): sync generated content"
-        ok, output = git_commit_and_push(message)
-        report["gitPushed"] = ok
-        report["gitMessage"] = message
-        report["gitOutput"] = output[-2000:]
-    else:
-        report["gitPushed"] = False
     print(json.dumps(report, ensure_ascii=False, indent=2))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

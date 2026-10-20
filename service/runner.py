@@ -102,10 +102,13 @@ def event_args():
     except (OSError, json.JSONDecodeError):
         event = {}
     args = []
-    for key in ("requestId", "event", "noteId", "pinned"):
+    for key in ("requestId", "event", "noteId"):
         value = event.get(key)
         if value is not None and str(value):
             args.extend([f"--{key}", str(value)])
+    note_ids = event.get("noteIds") or []
+    if note_ids:
+        args.extend(["--noteIds", *[str(note_id) for note_id in note_ids]])
     return event, args
 
 
@@ -138,7 +141,7 @@ def build():
 
 
 def commit_and_push(report):
-    paths = ["src/data/trilium-posts.content.generated.ts", "src/data/trilium-posts.meta.generated.ts", "public/trilium-assets", "src/data/posts.ts"]
+    paths = ["src/data/trilium-posts.content.generated.ts", "src/data/trilium-posts.meta.generated.ts", "public/trilium-assets"]
     run(["git", "add", "--", *paths], cwd=WORKSPACE)
     staged = run(["git", "diff", "--cached", "--quiet"], cwd=WORKSPACE, check=False)
     if staged.returncode == 0:
@@ -164,9 +167,11 @@ def main():
         try:
             prepare_workspace()
             event, args = event_args()
-            env = {**os.environ, "LONGBLOG_REPO_DIR": str(WORKSPACE), "LONGBLOG_RUNTIME_DIR": str(RUNTIME), "LONGBLOG_AUTO_PUSH": "false"}
+            env = {**os.environ, "LONGBLOG_REPO_DIR": str(WORKSPACE), "LONGBLOG_RUNTIME_DIR": str(RUNTIME)}
             result = run([sys.executable, str(SYNC_SCRIPT), *args], cwd=WORKSPACE, env=env, timeout=900)
             report = json.loads(result.stdout)
+            if report.get("failed"):
+                raise RuntimeError("article conversion failed; refusing to publish an incomplete snapshot")
             changed = run(["git", "status", "--porcelain", "--", "src/data", "public/trilium-assets"], cwd=WORKSPACE).stdout.strip()
             if changed:
                 build()
@@ -175,7 +180,6 @@ def main():
                 committed, pushed, message = False, False, ""
             report.update({"gitChanged": bool(changed), "gitCommitted": committed, "gitPushed": pushed, "gitMessage": message, "buildRan": bool(changed), "runStartedAt": started, "runFinishedAt": datetime.now().astimezone().isoformat(), "source": event.get("source", "manual"), "event": event.get("event") or "", "noteId": event.get("noteId") or ""})
             atomic_json(REPORT_FILE, report)
-            EVENT_FILE.unlink(missing_ok=True)
             try:
                 notify_report(report)
             except Exception:
