@@ -13,7 +13,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from asset_cleanup import prune_unused_assets
-from article_metadata import normalize_post_metadata, note_url_identifier, summarize_html
+from article_metadata import normalize_post_metadata, note_url_identifier, summarize_html, manual_summary
 from legacy_attributes import cleanup_legacy_attributes
 
 BASE_URL = os.environ.get("TRILIUM_BASE_URL", "").rstrip("/")
@@ -372,8 +372,9 @@ def build_post_record(note: dict) -> Tuple[dict, dict]:
     html, _ = strip_manager_injections(html)
     html_localized, local_assets, assets_changed = localize_attachments(html, note_id)
     slug = note_id
-    summary = summarize_html(html_localized, title)
-    payload_for_hash = {"title": title, "slug": slug, "contentHtml": html_localized}
+    handwritten = manual_summary(note)
+    summary = handwritten or summarize_html(html_localized, title)
+    payload_for_hash = {"title": title, "slug": slug, "contentHtml": html_localized, "manualSummary": handwritten}
     sync_hash = hashlib.sha256(json.dumps(payload_for_hash, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
     post = {
         "id": note_id,
@@ -383,6 +384,7 @@ def build_post_record(note: dict) -> Tuple[dict, dict]:
         "publishedAt": last_label_value(attr_map, "publishedAt", "").strip(),
         "tags": [],
         "summary": summary,
+        "manualSummary": handwritten,
         "contentHtml": html_localized,
         "syncHash": sync_hash,
         "syncStatus": last_label_value(attr_map, "syncStatus", ""),
@@ -405,6 +407,7 @@ def split_post_records(posts: List[dict]) -> Tuple[List[dict], List[dict]]:
             "id": post["id"],
             "title": post["title"],
             "summary": post["summary"],
+            "manualSummary": post.get("manualSummary", ""),
             "contentHtml": post["contentHtml"],
         })
         metas.append({
@@ -429,7 +432,7 @@ def write_generated_files(posts: List[dict]):
 
     content_text = "// Auto-generated from Trilium ETAPI\n"
     content_text += "export interface TriliumPostContentRecord {\n"
-    content_text += "  id: string; title: string; summary: string; contentHtml: string;\n"
+    content_text += "  id: string; title: string; summary: string; manualSummary?: string; contentHtml: string;\n"
     content_text += "}\n\n"
     content_text += "export const triliumPostContents: TriliumPostContentRecord[] = " + json.dumps(contents, ensure_ascii=False, indent=2) + ";\n"
     with open(OUT_CONTENT_TS, "w", encoding="utf-8") as f:
@@ -529,6 +532,14 @@ def main():
         cleanup_notes, lambda attribute_id: delete_path(f"/etapi/attributes/{attribute_id}"),
         os.path.join(os.path.dirname(PUBLISHED_AT_REGISTRY), "retired_attributes_backup.json"),
     )
+    # Expose the author's field in the existing Trilium article template.
+    for template in cleanup_notes:
+        if template.get("noteId") == TEMPLATE_NOTE_ID and not any(
+            attr.get("type") == "label" and attr.get("name") == "label:摘要"
+            for attr in template.get("attributes") or []
+        ):
+            set_label(TEMPLATE_NOTE_ID, "label:摘要", "promoted")
+            break
     targeted_ids = set(args.noteIds) | ({args.noteId} if args.noteId else set())
     ordered_notes = sorted(all_notes, key=lambda note: note.get("noteId") not in targeted_ids)
 
@@ -637,6 +648,7 @@ def main():
                     "publishedAt": existing_meta_item.get("publishedAt") or "",
                     "tags": [],
                     "summary": existing_content_item.get("summary") or "",
+                    "manualSummary": manual_summary(note),
                     "contentHtml": existing_content_item.get("contentHtml") or "",
                     "syncHash": existing_meta_item.get("syncHash") or "",
                     "syncStatus": "published",

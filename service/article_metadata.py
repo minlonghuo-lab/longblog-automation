@@ -1,4 +1,4 @@
-"""Deterministic summaries from published HTML; no editor fields or model calls."""
+"""Author-written mascot summaries and deterministic SEO excerpts; no model calls."""
 
 import re
 from html.parser import HTMLParser
@@ -66,8 +66,18 @@ def note_url_identifier(note_id):
     return note_id
 
 
+def manual_summary(note):
+    """The Chinese 摘要 label is the only source of mascot replies."""
+    values = [attr.get("value") or "" for attr in note.get("attributes") or []
+              if attr.get("type") == "label" and attr.get("name") == "摘要"]
+    return str(values[-1]).replace("\r\n", "\n").replace("\r", "\n").strip() if values else ""
+
+
 def normalize_post_metadata(post):
-    """Use the cached public body, never an unrequested draft, during migration."""
-    result = {**post, "slug": note_url_identifier(post.get("id")), "summary": summarize_html(post.get("contentHtml"), post.get("title")), "tags": []}
+    """Use the published body for fallback SEO text, without inventing mascot replies."""
+    handwritten = str(post.get("manualSummary") or "").strip()
+    result = {**post, "slug": note_url_identifier(post.get("id")),
+              "manualSummary": handwritten,
+              "summary": handwritten or summarize_html(post.get("contentHtml"), post.get("title")), "tags": []}
     result.pop("pinned", None)
     return result

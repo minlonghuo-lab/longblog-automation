@@ -12,7 +12,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "service"))
-from article_metadata import normalize_post_metadata, note_url_identifier, summarize_html
+from article_metadata import normalize_post_metadata, note_url_identifier, summarize_html, manual_summary
 from legacy_attributes import cleanup_legacy_attributes
 import poll_trilium_changes as poll
 import sync_trilium_posts as sync
@@ -45,6 +45,18 @@ class SummaryTests(unittest.TestCase):
         self.assertEqual(summarize_html('<figure><img src="x"></figure>', '照片'), '一起读读《照片》。')
         sentence = '这篇文章记录博客自动发布流程，包含正文转换与附件管理。'
         self.assertEqual(summarize_html('<p>' + sentence + '其他文字' * 100 + '</p>'), sentence)
+
+    def test_chinese_label_is_the_only_mascot_summary_and_preserves_author_text(self):
+        text = '手写摘要。\n' + '不截断作者文字。' * 30
+        article = note('A', summary='旧的英文摘要', **{'摘要': text})
+        self.assertEqual(manual_summary(article), text)
+        self.assertEqual(manual_summary(note('A', summary='旧值')), '')
+        updated = normalize_post_metadata({'id': 'A', 'manualSummary': text, 'contentHtml': '<p>正文。</p>'})
+        self.assertEqual(updated['manualSummary'], text)
+        self.assertEqual(updated['summary'], text)
+        cleared = normalize_post_metadata({**updated, 'manualSummary': ''})
+        self.assertEqual(cleared['manualSummary'], '')
+        self.assertNotEqual(cleared['summary'], text)
 
     def test_cached_metadata_is_rebuilt_without_old_fields(self):
         old = {'id': 'xtusIYhPQyK5', 'slug': '旧标题', 'title': '文章', 'summary': '旧 AI 摘要', 'tags': ['旧标签'], 'pinned': True,
@@ -81,6 +93,12 @@ class LegacyMigrationTests(unittest.TestCase):
         self.assertEqual(self.backup.stat().st_mode & 0o777, 0o600)
         self.assertEqual(cleanup_legacy_attributes([note('A', publish='true')], remove, self.backup), 0)
 
+    def test_chinese_summary_and_template_definitions_are_never_retired(self):
+        article = note('A', summary='旧字段', **{'摘要': '我的摘要', 'label:摘要': 'promoted', 'child:label:摘要': 'promoted'})
+        deleted = Mock()
+        self.assertEqual(cleanup_legacy_attributes([article], deleted, self.backup), 1)
+        deleted.assert_called_once_with('Asummary')
+
     def test_failed_cleanup_keeps_backup_and_can_retry(self):
         with self.assertRaises(RuntimeError):
             cleanup_legacy_attributes([note('A', summary='旧摘要')], Mock(side_effect=RuntimeError()), self.backup)
@@ -116,6 +134,13 @@ class PollerTests(unittest.TestCase):
         new = {'A': state('A', title='新草稿标题', contentHash='new')}
         self.assertEqual(poll.differences(old, new), [])
         self.assertEqual(poll.differences({'A': state('A', sync=True)}, new), [])
+
+    def test_summary_edit_remains_explicitly_published_through_sync(self):
+        old = {'A': state('A', manualSummary='原摘要')}
+        current = {'A': state('A', manualSummary='新摘要')}
+        self.assertEqual(poll.differences(old, current), [])
+        current['A']['sync'] = True
+        self.assertEqual(poll.differences(old, current)[0]['changed'], ['sync'])
 
     def test_publish_sync_and_removal_still_trigger(self):
         old = {'A': state('A')}
@@ -252,6 +277,34 @@ class SyncIntegrationTests(unittest.TestCase):
         before = Path(sync.OUT_CONTENT_TS).read_bytes(), Path(sync.OUT_META_TS).read_bytes()
         self.execute()
         self.assertEqual(before, (Path(sync.OUT_CONTENT_TS).read_bytes(), Path(sync.OUT_META_TS).read_bytes()))
+
+    def test_manual_summary_migration_uses_labels_and_published_cache_without_drafts(self):
+        handwritten = '这里是作者自己填写的摘要。\n' + '保留完整文字。' * 20
+        self.notes[1]['attributes'] += note('A', **{'摘要': handwritten})['attributes']
+        result, report, labels, content = self.execute()
+        self.assertEqual(result, 0)
+        content.assert_not_called()
+        article = next(item for item in sync.load_existing_content_records() if item['id'] == 'A')
+        self.assertEqual(article['manualSummary'], handwritten)
+        self.assertEqual(article['summary'], handwritten)
+        self.assertEqual(article['contentHtml'], self.body)
+        self.assertTrue(any(attr['name'] == 'label:摘要' for attr in self.notes[-1]['attributes']))
+        self.notes[1]['attributes'] = [attr for attr in self.notes[1]['attributes'] if attr['name'] != '摘要']
+        result, report, labels, content = self.execute()
+        content.assert_not_called()
+        article = next(item for item in sync.load_existing_content_records() if item['id'] == 'A')
+        self.assertEqual(article['manualSummary'], '')
+        self.assertEqual(article['summary'], '这是已经发布的正文，自动提取出简短摘要供小宠物展示。')
+
+    def test_explicit_sync_includes_handwritten_summary_in_content_hash(self):
+        item = note('A', publish='true', **{'摘要': '第一份手写摘要。'})
+        with patch.object(sync, 'get_text', return_value=self.body), patch.object(sync, 'localize_attachments', side_effect=lambda text, note_id: (text, [], False)):
+            first, _ = sync.build_post_record(item)
+            item['attributes'][-1]['value'] = '第二份手写摘要。'
+            second, _ = sync.build_post_record(item)
+        self.assertNotEqual(first['syncHash'], second['syncHash'])
+        self.assertEqual(second['manualSummary'], '第二份手写摘要。')
+        self.assertEqual(second['summary'], '第二份手写摘要。')
 
     def test_targeted_sync_does_not_download_another_articles_draft(self):
         result, report, labels, content = self.execute('sync_requested', ['A'])
