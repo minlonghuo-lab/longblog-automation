@@ -13,7 +13,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from asset_cleanup import prune_unused_assets
-from article_metadata import normalize_post_metadata, summarize_html
+from article_metadata import normalize_post_metadata, note_url_identifier, summarize_html
 from legacy_attributes import cleanup_legacy_attributes
 
 BASE_URL = os.environ.get("TRILIUM_BASE_URL", "").rstrip("/")
@@ -90,37 +90,6 @@ def ensure_dir(path: str):
     os.makedirs(path, exist_ok=True)
 
 
-def slugify(title: str) -> str:
-    t = normalize_whitespace(title).strip().lower()
-    t = re.sub(r"\s+", "-", t)
-    t = re.sub(r"[^\w\-\u4e00-\u9fff]", "", t)
-    t = re.sub(r"-+", "-", t).strip("-")
-    return t or "post"
-
-
-def ensure_unique_slug(base_slug: str, note_id: str, used_slugs: set, previous_slug_map: Dict[str, str]) -> str:
-    slug = base_slug or "post"
-    previous_slug = (previous_slug_map.get(note_id) or "").strip()
-    if previous_slug and slug == previous_slug:
-        used_slugs.add(slug)
-        return slug
-    if slug not in used_slugs:
-        used_slugs.add(slug)
-        return slug
-    suffix = note_id[:6].lower()
-    candidate = f"{slug}-{suffix}"
-    if candidate == previous_slug or candidate not in used_slugs:
-        used_slugs.add(candidate)
-        return candidate
-    index = 2
-    while True:
-        candidate = f"{slug}-{suffix}-{index}"
-        if candidate == previous_slug or candidate not in used_slugs:
-            used_slugs.add(candidate)
-            return candidate
-        index += 1
-
-
 def normalize_whitespace(text: str) -> str:
     text = (text or "").replace("\r\n", "\n").replace("\r", "\n")
     text = re.sub(r"[ \t]+", " ", text)
@@ -129,7 +98,7 @@ def normalize_whitespace(text: str) -> str:
 
 
 def normalize_label_value(text: str) -> str:
-    return normalize_whitespace(str(text or "")).replace("T", " ")
+    return normalize_whitespace(str(text or ""))
 
 
 def label_attrs(attrs: List[dict]) -> Dict[str, List[dict]]:
@@ -166,6 +135,8 @@ def bool_label_value(attr_map: Dict[str, List[dict]], name: str, default: bool =
 
 def set_label(note_id: str, name: str, value: str):
     value = normalize_label_value(value)
+    if name in {"publishedAt", "updatedAt"}:
+        value = value.replace("T", " ", 1)
     live_attrs = (get_json(f"/etapi/notes/{note_id}").get("attributes", []) or [])
     matches = [a for a in live_attrs if a.get("type") == "label" and a.get("name") == name]
     if matches:
@@ -297,9 +268,8 @@ def render_include_note_card(note_id: str, target: dict) -> str:
     """Build the card for an embedded note.
 
     The href follows the blog's routing contract: article URLs are
-    `/blog/<noteId>/`, ASCII and with a trailing slash. The slug is editable and
-    kept only for search and for the legacy redirect map, so an internal link
-    built from it would depend on that migration table.
+    `/blog/<noteId>/`, ASCII and with a trailing slash. The exported slug and
+    Trilium URL identifier use that exact same case-preserving noteId.
     """
     summary = str(target.get("summary") or "").strip()
     summary_html = (
@@ -333,7 +303,7 @@ def render_include_note_cards(html: str, index: Dict[str, dict]) -> Tuple[str, i
         if not note_id_match:
             return match.group(0)
         target = index.get(note_id_match.group(1))
-        if not target or not target.get("slug"):
+        if not target:
             return match.group(0)
         replaced += 1
         return render_include_note_card(note_id_match.group(1), target)
@@ -344,10 +314,10 @@ def render_include_note_cards(html: str, index: Dict[str, dict]) -> Tuple[str, i
 def apply_include_note_cards(posts: List[dict]) -> int:
     """Resolve embedded notes across the whole published set.
 
-    Runs once every post is built so a card can link to the final slug of a note
+    Runs once every post is built so a card can link to the stable ID of a note
     published in the same run, whatever order the two were processed in.
     """
-    index = {str(post["id"]): post for post in posts if post.get("id") and post.get("slug")}
+    index = {str(post["id"]): post for post in posts if post.get("id")}
     total = 0
     for post in posts:
         cleaned, replaced = render_include_note_cards(str(post.get("contentHtml") or ""), index)
@@ -394,16 +364,14 @@ def localize_attachments(html: str, note_id: str) -> Tuple[str, List[str], bool]
     return html, local_assets, changed
 
 
-def build_post_record(note: dict, used_slugs: set, previous_slug_map: Dict[str, str]) -> Tuple[dict, dict]:
-    note_id = note["noteId"]
+def build_post_record(note: dict) -> Tuple[dict, dict]:
+    note_id = note_url_identifier(note["noteId"])
     attr_map = label_attrs(note.get("attributes", []) or [])
     title = (note.get("title") or "未命名").strip()
     html = get_text(f"/etapi/notes/{note_id}/content")
     html, _ = strip_manager_injections(html)
     html_localized, local_assets, assets_changed = localize_attachments(html, note_id)
-    explicit_slug = last_label_value(attr_map, "slug", "").strip()
-    base_slug = explicit_slug or slugify(title)
-    slug = ensure_unique_slug(base_slug, note_id, used_slugs, previous_slug_map)
+    slug = note_id
     summary = summarize_html(html_localized, title)
     payload_for_hash = {"title": title, "slug": slug, "contentHtml": html_localized}
     sync_hash = hashlib.sha256(json.dumps(payload_for_hash, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
@@ -545,6 +513,7 @@ def main():
         "removed": [],
         "removedAssets": [],
         "prunedAssets": [],
+        "urlIdentifiersUpdated": 0,
         "workspaceDir": BASE_DIR,
     }
 
@@ -580,6 +549,15 @@ def main():
         except Exception:
             pass
         attr_map = label_attrs(note.get("attributes", []) or [])
+        try:
+            identifier = note_url_identifier(note["noteId"])
+            slug_attributes = attr_map.get("slug") or []
+            if len(slug_attributes) != 1 or str(slug_attributes[0].get("value") or "") != identifier:
+                set_label(identifier, "slug", identifier)
+                report["urlIdentifiersUpdated"] += 1
+        except Exception as error:
+            report["failed"].append({"id": note.get("noteId"), "error": str(error)[:300]})
+            continue
         publish_value = "true" if bool_label_value(attr_map, "publish", False) else "false"
         if publish_value != "true":
             if last_label_value(attr_map, "syncStatus", "") == "published":
@@ -606,9 +584,6 @@ def main():
     existing_content = load_existing_content_records()
     existing_meta_map = {str(item.get("id") or ""): item for item in existing_meta if str(item.get("id") or "")}
     existing_content_map = {str(item.get("id") or ""): item for item in existing_content if str(item.get("id") or "")}
-    previous_slug_map = {str(meta.get("id") or "").strip(): str(meta.get("slug") or "").strip() for meta in existing_meta if str(meta.get("id") or "").strip()}
-    used_slugs = {slug for slug in previous_slug_map.values() if slug}
-
     for note in candidates:
         report["publishedCandidates"] += 1
         try:
@@ -624,7 +599,7 @@ def main():
             needs_full_sync = bool(sync_requested or publish_requested or targeted_sync_requested or not can_reuse_existing)
 
             if needs_full_sync:
-                post, meta = build_post_record(note, used_slugs, previous_slug_map)
+                post, meta = build_post_record(note)
                 if not post["publishedAt"]:
                     post["publishedAt"] = published_at_registry.get(note_id, "") or (existing_meta_item or {}).get("publishedAt", "")
                 first_publish = not post["publishedAt"]
@@ -633,7 +608,6 @@ def main():
                 if needs_publish:
                     set_label(note_id, "syncStatus", "publishing")
                     ts = now_str()
-                    set_label(note_id, "slug", post["slug"])
                     if not post["publishedAt"]:
                         post["publishedAt"] = ts
                         set_label(note_id, "publishedAt", ts)
@@ -657,7 +631,7 @@ def main():
             else:
                 post = {
                     "id": note_id,
-                    "slug": existing_meta_item.get("slug", slugify(note.get("title") or "未命名")),
+                    "slug": note_id,
                     "title": existing_content_item.get("title") or note.get("title") or "未命名",
                     "updatedAt": existing_meta_item.get("updatedAt") or now_str(),
                     "publishedAt": existing_meta_item.get("publishedAt") or "",

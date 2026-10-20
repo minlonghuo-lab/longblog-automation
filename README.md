@@ -269,12 +269,13 @@ initialized snapshot notes=N
 | `publish=true` | 发布文章 |
 | `publish=false` | 从博客撤下 |
 | `sync=true` | 强制同步正文和附件，完成后自动回写 false |
+| `slug`（URL 标识） | 程序自动维护为原样 noteID，不再接受标题或自定义别名 |
 | `publishedAt` | 首次发布时间，只在从未发布时创建 |
 | `updatedAt` | 最近成功同步时间 |
 | `syncStatus` | `publishing` / `published` / `removed` / `error` |
 | `syncHash` | 内容指纹 |
 
-### 摘要与旧字段迁移
+### 摘要、旧字段和 URL 标识迁移
 
 摘要由已发布正文的首段有效文字自动提取，最多 80 个字符，优先按句子截取。代码、Mermaid 源码、表格、标题、引用和图片容器不会进入摘要；没有合适正文时使用文章标题作为导读。不调用 AI，不需要模型密钥，也不再向 Trilium 回写摘要或文章标签。摘要继续供博客 SEO、引用卡片和桌面小宠物使用。
 
@@ -283,7 +284,10 @@ initialized snapshot notes=N
 1. 先把博客子树和 `TRILIUM_TEMPLATE_NOTE_ID` 指定模板中这四个字段的自有值、`label:` 升级属性定义和 `child:` 复制定义备份到 `data/runtime/state/retired_attributes_backup.json`；
 2. 删除上述旧属性，包括截图里的四个入口。不会修改博客范围外的属性来源或其它关系；
 3. 从仓库中已发布的正文重新生成摘要、清空导出标签并移除置顶数据，不读取尚未要求同步的正文修改，保留首次发布和更新时间；
-4. 构建验证并推送，成功后记录 `data/runtime/state/publication_policy.json`，后续只处理新发布指令。
+4. 将现有文章（含未发布草稿）的 URL 标识 `slug` 纠正为该笔记的原样 noteID；导出的 `slug` 也等于 `id`，不读取草稿正文、不改变日期；
+5. 构建验证并推送，成功后记录 `data/runtime/state/publication_policy.json`，后续只处理新发布指令。
+
+发布策略版本为 3；已经完成版本 2 迁移的实例，升级后也会自动执行 URL 标识纠正。例如 `xtusIYhPQyK5` 的 URL 标识必须为 `xtusIYhPQyK5`，文章 URL 为 `/blog/xtusIYhPQyK5/`，不随标题改变。旧中文链接的静态跳转表仍由博客保留。
 
 `tags: []` 保留在生成数据中，以兼容博客当前的数据结构；不会再生成或处理标签。首次部署仍只建立快照，首次手动发布/同步时执行字段清理。失败任务保存在 `last_event.json` 中，构建或推送失败后自动重试；多篇文章的指令合并为一次构建和推送。
 

@@ -12,7 +12,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "service"))
-from article_metadata import normalize_post_metadata, summarize_html
+from article_metadata import normalize_post_metadata, note_url_identifier, summarize_html
 from legacy_attributes import cleanup_legacy_attributes
 import poll_trilium_changes as poll
 import sync_trilium_posts as sync
@@ -47,12 +47,13 @@ class SummaryTests(unittest.TestCase):
         self.assertEqual(summarize_html('<p>' + sentence + '其他文字' * 100 + '</p>'), sentence)
 
     def test_cached_metadata_is_rebuilt_without_old_fields(self):
-        old = {'title': '文章', 'summary': '旧 AI 摘要', 'tags': ['旧标签'], 'pinned': True,
+        old = {'id': 'xtusIYhPQyK5', 'slug': '旧标题', 'title': '文章', 'summary': '旧 AI 摘要', 'tags': ['旧标签'], 'pinned': True,
                'contentHtml': '<p>这是一段已发布的正文，用来重新生成简短摘要。</p>', 'publishedAt': '2025-01-01'}
         new = normalize_post_metadata(old)
         self.assertEqual(new['summary'], '这是一段已发布的正文，用来重新生成简短摘要。')
         self.assertEqual(new['tags'], [])
         self.assertNotIn('pinned', new)
+        self.assertEqual(new['slug'], 'xtusIYhPQyK5')
         self.assertEqual(old['summary'], '旧 AI 摘要')
         self.assertEqual(new['publishedAt'], old['publishedAt'])
 
@@ -183,7 +184,7 @@ class PollerTests(unittest.TestCase):
         with patch.object(poll, 'snapshot', return_value=old), patch.object(poll.subprocess, 'run') as run:
             self.assertEqual(poll.main(), 0)
             run.assert_not_called()
-        poll.POLICY_FILE.unlink()
+        poll.write_json(poll.POLICY_FILE, {"version": 2})
         with patch.object(poll, 'snapshot', return_value=old), patch.object(poll.subprocess, 'run', return_value=Mock(returncode=0)) as run:
             self.assertEqual(poll.main(), 0)
             run.assert_called_once()
@@ -206,17 +207,21 @@ class SyncIntegrationTests(unittest.TestCase):
             item.start()
             self.addCleanup(item.stop)
         self.body = '<p>这是已经发布的正文，自动提取出简短摘要供小宠物展示。</p>'
-        self.posts = [{"id": key, "title": "文章 " + key, "slug": key, "contentHtml": self.body,
+        self.posts = [{"id": key, "title": "文章 " + key, "slug": '旧标题-' + key, "contentHtml": self.body,
                        "summary": "旧摘要", "tags": ["旧标签"], "pinned": True, "publishedAt": '2025-01-01',
                        "updatedAt": '2025-01-02', "syncHash": "old", "syncStatus": "published"} for key in ['A', 'B']]
         sync.write_generated_files(self.posts)
-        self.notes = [note('root'), note('A', publish='true', summary='旧摘要'), note('B', publish='true'),
+        self.notes = [note('root'), note('A', publish='true', summary='旧摘要', slug='旧标题-A'), note('B', publish='true', slug='旧标题-B'),
                       note('template', **{'label:tags': 'promoted', 'label:summary': 'promoted', 'label:pinned': 'promoted', 'label:aiRefresh': 'promoted'})]
 
     def execute(self, event='metadata_migrated', ids=(), fail=None):
         by_id = {item['noteId']: item for item in self.notes}
         def get(path):
             return copy.deepcopy(by_id[path.split('/')[3]])
+        def set_label(note_id, name, value):
+            attrs = by_id[note_id]['attributes']
+            attrs[:] = [attr for attr in attrs if attr['name'] != name]
+            attrs.append({'attributeId': note_id + name, 'noteId': note_id, 'type': 'label', 'name': name, 'value': value})
         def delete(path):
             for item in self.notes:
                 item['attributes'] = [attr for attr in item['attributes'] if attr['attributeId'] != path.rsplit('/', 1)[1]]
@@ -224,7 +229,7 @@ class SyncIntegrationTests(unittest.TestCase):
         output = io.StringIO()
         with patch.object(sync, 'parse_args', return_value=args), patch.object(sync, 'get_json', side_effect=get), \
              patch.object(sync, 'walk_note_tree', return_value=self.notes), patch.object(sync, 'delete_path', side_effect=delete), \
-             patch.object(sync, 'set_label') as label, patch.object(sync, 'get_text', side_effect=fail, return_value=self.body) as content, \
+             patch.object(sync, 'set_label', side_effect=set_label) as label, patch.object(sync, 'get_text', side_effect=fail, return_value=self.body) as content, \
              patch.object(sync, 'localize_attachments', side_effect=lambda html, note_id: (html, [], False)), \
              patch('subprocess.run') as process, contextlib.redirect_stdout(output):
             result = sync.main()
@@ -238,6 +243,7 @@ class SyncIntegrationTests(unittest.TestCase):
         content.assert_not_called()
         self.assertEqual(sync.load_existing_content_records()[0]['summary'], '这是已经发布的正文，自动提取出简短摘要供小宠物展示。')
         for item in sync.load_existing_meta_records():
+            self.assertEqual(item['slug'], item['id'])
             self.assertEqual(item['tags'], [])
             self.assertNotIn('pinned', item)
             self.assertEqual(item['publishedAt'], '2025-01-01')
@@ -254,6 +260,43 @@ class SyncIntegrationTests(unittest.TestCase):
         self.assertEqual([item['id'] for item in report['updated']], ['A'])
         self.assertEqual([item['id'] for item in report['unchanged']], ['B'])
         self.assertEqual({item['id']: item['publishedAt'] for item in sync.load_existing_meta_records()}, {'A': '2025-01-01', 'B': '2025-01-01'})
+
+    def test_url_identifier_migration_covers_unpublished_notes_without_fetching_bodies(self):
+        self.notes.append(note('xtusIYhPQyK5', publish='false', slug='说说页面加速与自动更新原理详解'))
+        result, report, labels, content = self.execute()
+        self.assertEqual(result, 0)
+        content.assert_not_called()
+        labels.assert_any_call('xtusIYhPQyK5', 'slug', 'xtusIYhPQyK5')
+        self.assertEqual(report['urlIdentifiersUpdated'], 3)
+        _, repeated, _, _ = self.execute()
+        self.assertEqual(repeated['urlIdentifiersUpdated'], 0)
+
+    def test_title_or_custom_slug_cannot_change_an_articles_identifier(self):
+        original = {'noteId': 'xtusIYhPQyK5', 'title': '说说页面加速与自动更新原理详解',
+                    'attributes': note('xtusIYhPQyK5', slug='手工填写的标题')['attributes']}
+        with patch.object(sync, 'get_text', return_value=self.body), patch.object(sync, 'localize_attachments', return_value=(self.body, [], False)):
+            first, _ = sync.build_post_record(original)
+            renamed, _ = sync.build_post_record({**original, 'title': '修改后的文章标题'})
+            same_title, _ = sync.build_post_record({**original, 'noteId': 'OtherID'})
+        self.assertEqual(first['slug'], 'xtusIYhPQyK5')
+        self.assertEqual(renamed['slug'], first['slug'])
+        self.assertEqual(same_title['slug'], 'OtherID')
+        for invalid in ['', '../secret', '中文', 'a/b', 'a?x=1', None]:
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                note_url_identifier(invalid)
+
+    def test_real_attribute_writer_preserves_capital_T_in_note_ids(self):
+        identifier = '4o1kCT4CizAt'
+        existing = note(identifier, slug='旧中文标题')
+        with patch.object(sync, 'get_json', return_value=existing), patch.object(sync, 'patch_json') as update:
+            sync.set_label(identifier, 'slug', identifier)
+            update.assert_called_once_with('/etapi/attributes/' + identifier + 'slug', {'value': identifier})
+        with patch.object(sync, 'get_json', return_value=note(identifier)), patch.object(sync, 'post_json') as create:
+            sync.set_label(identifier, 'slug', identifier)
+            self.assertEqual(create.call_args.args[1]['value'], identifier)
+        with patch.object(sync, 'get_json', return_value=note(identifier)), patch.object(sync, 'post_json') as create:
+            sync.set_label(identifier, 'publishedAt', '2025-01-01T12:00:00+0800')
+            self.assertEqual(create.call_args.args[1]['value'], '2025-01-01 12:00:00+0800')
 
     def test_conversion_failure_keeps_generated_snapshot_and_assets(self):
         before = Path(sync.OUT_CONTENT_TS).read_bytes(), Path(sync.OUT_META_TS).read_bytes()

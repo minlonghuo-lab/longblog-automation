@@ -59,8 +59,15 @@ def summarize_html(content_html, title="", limit=80):
     return prefix.rstrip("，、；：,;: ") + "…"
 
 
+def note_url_identifier(note_id):
+    """Match the blog's case-preserving ASCII noteId route contract."""
+    if not isinstance(note_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", note_id):
+        raise ValueError("Article URLs require a non-empty ASCII Trilium noteId")
+    return note_id
+
+
 def normalize_post_metadata(post):
     """Use the cached public body, never an unrequested draft, during migration."""
-    result = {**post, "summary": summarize_html(post.get("contentHtml"), post.get("title")), "tags": []}
+    result = {**post, "slug": note_url_identifier(post.get("id")), "summary": summarize_html(post.get("contentHtml"), post.get("title")), "tags": []}
     result.pop("pinned", None)
     return result

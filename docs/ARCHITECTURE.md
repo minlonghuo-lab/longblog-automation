@@ -51,13 +51,14 @@ public/trilium-assets/
 
 前端手工代码不在自动提交范围内。
 
-## 发布策略 v2
+## 发布策略 v3（包含 v2 的元数据精简）
 
 - 轮询只读取笔记属性，`publish` 切换和 `sync` 从 false 到 true 产生任务；旧的标签、手填摘要、AI 刷新和置顶不再是输入。
 - 一批任务只调用一次 runner，显式目标 ID 随事件传递。失败后保留事件，新任务合并入待重试批次；完整同步、构建和推送成功后才更新轮询快照并删除事件。
 - `article_metadata.py` 从发布正文提取最多 80 字的摘要。迁移时仅使用仓库已发布的正文，不把用户未要求同步的草稿带上线。
 - `legacy_attributes.py` 在删除旧字段前原子写入备份。只处理博客树和指定模板内的自有属性，错误会中止迁移并重试。
 - 转换器不再执行 Git 或模型子进程，runner 独占构建和推送职责；转换存在失败时不写出不完整文章列表，也不回收附件。
+- `slug` 在 Trilium 和生成数据中均强制等于原样 noteID。移除标题转 slug、手工别名、碰撞后缀分配；纯标识迁移不读取正文、不改文章日期，覆盖未发布草稿。
 - 生成数据保留 `tags: []` 兼容前端接口，不导出 `pinned`；排序仅依据首次发布时间。
 
 Trilium 的字段值和显示入口分别是普通标签与 `label:` 定义，因此迁移需要一并清理。参见 [Trilium 升级属性文档](https://docs.triliumnotes.org/user-guide/advanced-usage/attributes/promoted-attributes)。

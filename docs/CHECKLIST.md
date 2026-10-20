@@ -38,12 +38,13 @@
 - [ ] 仅在必要时重新启用雨云 poller
 - [ ] 不允许两套 poller 同时运行
 
-## 发布策略 v2 升级验证
+## 发布策略 v3 升级验证
 
 - [ ] 重新构建并启动镜像
 - [ ] `retired_attributes_backup.json` 留有旧字段备份
 - [ ] 文章和模板不再显示标签、摘要、刷新 AI、置顶入口
-- [ ] `publication_policy.json` 中 version 为 2
+- [ ] `publication_policy.json` 中 version 为 3
+- [ ] URL 标识为原样 noteID，导出的 slug 等于 id，改标题不会改 URL
 - [ ] 摘要自动生成且不超过 80 字；首次发布时间保持不变
 - [ ] 单纯编辑正文不会发布，`sync=true` 可以发布修改
 - [ ] 多篇修改只产生一次构建和推送
